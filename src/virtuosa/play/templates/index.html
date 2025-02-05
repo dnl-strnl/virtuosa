@@ -1,0 +1,112 @@
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Virtuosa</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-3xl font-bold mb-8">Voice Playlist Creator</h1>
+
+        <!-- Voice Recording Section -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+            <h2 class="text-xl font-semibold mb-4">Create Playlist from Voice</h2>
+            <div class="flex flex-col gap-4">
+                <button id="recordButton" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">
+                    Start Recording
+                </button>
+                <div id="recordingStatus" class="text-gray-600"></div>
+                <div id="transcriptionText" class="text-gray-800 bg-gray-50 p-4 rounded-lg hidden"></div>
+            </div>
+        </div>
+
+        <!-- Playlists Section -->
+        <div class="bg-white rounded-lg shadow-md p-6">
+            <h2 class="text-xl font-semibold mb-4">Your Playlists</h2>
+            <div id="playlistsContainer" class="space-y-4">
+                {% for playlist in playlists %}
+                <div class="border rounded p-4">
+                    <h3 class="font-semibold">{{ playlist.name }}</h3>
+                    <p class="text-gray-600 text-sm mb-2">{{ playlist.description }}</p>
+                    <ul class="list-disc pl-5">
+                        {% for track in playlist.tracks %}
+                        <li>{{ track.title }} - {{ track.artist }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+        const recordButton = document.getElementById('recordButton');
+        const recordingStatus = document.getElementById('recordingStatus');
+        const transcriptionText = document.getElementById('transcriptionText');
+
+        recordButton.addEventListener('click', async () => {
+            if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+                // Start recording
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+
+                    mediaRecorder.addEventListener('dataavailable', event => {
+                        audioChunks.push(event.data);
+                    });
+
+                    mediaRecorder.addEventListener('stop', async () => {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                        const formData = new FormData();
+                        formData.append('audio', audioBlob);
+
+                        recordingStatus.textContent = 'Processing recording...';
+                        transcriptionText.classList.add('hidden');
+
+                        try {
+                            const response = await fetch('/api/create-playlist/voice', {
+                                method: 'POST',
+                                body: formData
+                            });
+
+                            if (!response.ok) throw new Error('Failed to create playlist');
+
+                            const playlist = await response.json();
+
+                            // Display transcription.
+                            transcriptionText.textContent = `Transcribed text: "${playlist.transcription}"`;
+                            transcriptionText.classList.remove('hidden');
+
+                            recordingStatus.textContent = 'Creating playlist...';
+
+                            setTimeout(() => {
+                                // Refresh to show new playlist after showing transcription.
+                                location.reload();
+                            }, 3000);
+
+                        } catch (error) {
+                            recordingStatus.textContent = 'Error creating playlist: ' + error.message;
+                        }
+                    });
+
+                    mediaRecorder.start();
+                    recordButton.textContent = 'Stop Recording';
+                    recordingStatus.textContent = 'Recording...';
+                    transcriptionText.classList.add('hidden');
+                } catch (error) {
+                    recordingStatus.textContent = 'Error accessing microphone: ' + error.message;
+                }
+            } else {
+                // Stop recording.
+                mediaRecorder.stop();
+                recordButton.textContent = 'Start Recording';
+                recordingStatus.textContent = 'Processing recording...';
+            }
+        });
+    </script>
+</body>
+</html>
