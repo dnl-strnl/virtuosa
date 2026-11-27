@@ -1,0 +1,6 @@
+__pycache__
+.DS_Store
+.cache
+env
+chroma_db/
+virtuosa.db
