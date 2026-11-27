@@ -1,112 +1,60 @@
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Virtuosa</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎻</text></svg>">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
-<body class="bg-gray-100">
-    <div class="container mx-auto px-4 py-8">
-        <h1 class="text-3xl font-bold mb-8">Voice Playlist Creator</h1>
+<body>
+    <div class="player-container">
+        <aside class="sidebar">
+            <h1>Virtuosa</h1>
+            <p class="library-stats">{{ "{:,}".format(track_count) }} tracks · {{ artist_count }} artists</p>
+            <button id="new-playlist-btn">+ New playlist</button>
+            <ul id="playlist-list" class="playlist-list"></ul>
+        </aside>
 
-        <!-- Voice Recording Section -->
-        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
-            <h2 class="text-xl font-semibold mb-4">Create Playlist from Voice</h2>
-            <div class="flex flex-col gap-4">
-                <button id="recordButton" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">
-                    Start Recording
+        <main class="main-content">
+            <section class="command">
+                <!-- a microphone for a new playlist, a pencil while editing one -->
+                <button id="voice-playlist-btn" class="voice-btn">
+                    <svg class="mic-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <rect x="9" y="3" width="6" height="11" rx="3"></rect>
+                        <path d="M5 11a7 7 0 0 0 14 0M12 18v3"></path>
+                    </svg>
+                    <svg class="edit-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19l-4 1z"></path>
+                        <path d="M14.5 6.5l3 3"></path>
+                    </svg>
                 </button>
-                <div id="recordingStatus" class="text-gray-600"></div>
-                <div id="transcriptionText" class="text-gray-800 bg-gray-50 p-4 rounded-lg hidden"></div>
-            </div>
-        </div>
+                <form id="command-form">
+                    <input id="command-input" type="text" autocomplete="off">
+                    <button type="submit">Send</button>
+                </form>
+            </section>
+            <p id="recording-status" class="recording-status"></p>
+            <ul id="activity" class="activity"></ul>
 
-        <!-- Playlists Section -->
-        <div class="bg-white rounded-lg shadow-md p-6">
-            <h2 class="text-xl font-semibold mb-4">Your Playlists</h2>
-            <div id="playlistsContainer" class="space-y-4">
-                {% for playlist in playlists %}
-                <div class="border rounded p-4">
-                    <h3 class="font-semibold">{{ playlist.name }}</h3>
-                    <p class="text-gray-600 text-sm mb-2">{{ playlist.description }}</p>
-                    <ul class="list-disc pl-5">
-                        {% for track in playlist.tracks %}
-                        <li>{{ track.title }} - {{ track.artist }}</li>
-                        {% endfor %}
-                    </ul>
+            <header class="playlist-header">
+                <div>
+                    <h2 id="playlist-name"></h2>
+                    <p id="playlist-meta" class="playlist-meta"></p>
                 </div>
-                {% endfor %}
-            </div>
-        </div>
+                <button id="delete-playlist-btn" class="quiet" hidden>Delete</button>
+            </header>
+            <ol id="track-list" class="track-list"></ol>
+        </main>
+
+        <footer class="player-controls">
+            <button id="prev-btn" title="Previous">&#9198;</button>
+            <button id="next-btn" title="Next">&#9197;</button>
+            <div id="now-playing" class="now-playing">Nothing playing</div>
+            <audio id="audio-player" controls></audio>
+        </footer>
     </div>
 
-    <script>
-        let mediaRecorder;
-        let audioChunks = [];
-        const recordButton = document.getElementById('recordButton');
-        const recordingStatus = document.getElementById('recordingStatus');
-        const transcriptionText = document.getElementById('transcriptionText');
-
-        recordButton.addEventListener('click', async () => {
-            if (!mediaRecorder || mediaRecorder.state === 'inactive') {
-                // Start recording
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    mediaRecorder = new MediaRecorder(stream);
-                    audioChunks = [];
-
-                    mediaRecorder.addEventListener('dataavailable', event => {
-                        audioChunks.push(event.data);
-                    });
-
-                    mediaRecorder.addEventListener('stop', async () => {
-                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                        const formData = new FormData();
-                        formData.append('audio', audioBlob);
-
-                        recordingStatus.textContent = 'Processing recording...';
-                        transcriptionText.classList.add('hidden');
-
-                        try {
-                            const response = await fetch('/api/create-playlist/voice', {
-                                method: 'POST',
-                                body: formData
-                            });
-
-                            if (!response.ok) throw new Error('Failed to create playlist');
-
-                            const playlist = await response.json();
-
-                            // Display transcription.
-                            transcriptionText.textContent = `Transcribed text: "${playlist.transcription}"`;
-                            transcriptionText.classList.remove('hidden');
-
-                            recordingStatus.textContent = 'Creating playlist...';
-
-                            setTimeout(() => {
-                                // Refresh to show new playlist after showing transcription.
-                                location.reload();
-                            }, 3000);
-
-                        } catch (error) {
-                            recordingStatus.textContent = 'Error creating playlist: ' + error.message;
-                        }
-                    });
-
-                    mediaRecorder.start();
-                    recordButton.textContent = 'Stop Recording';
-                    recordingStatus.textContent = 'Recording...';
-                    transcriptionText.classList.add('hidden');
-                } catch (error) {
-                    recordingStatus.textContent = 'Error accessing microphone: ' + error.message;
-                }
-            } else {
-                // Stop recording.
-                mediaRecorder.stop();
-                recordButton.textContent = 'Start Recording';
-                recordingStatus.textContent = 'Processing recording...';
-            }
-        });
-    </script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

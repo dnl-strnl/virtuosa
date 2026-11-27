@@ -1,116 +1,143 @@
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 import json
-from mutagen.easyid3 import EasyID3
-from mutagen.mp3 import MP3
-import ollama
+import logging
 import os
 from pathlib import Path
-import pprint
 import tempfile
-import tqdm
+import threading
 import whisper
 
-from virtuosa.play.chain import MusicLibraryChain
+from virtuosa.play.curator import PlaylistCurator
+from virtuosa.play.library import Library
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 music_library = Path("~/Music/Music/Media.localized/Music").expanduser()
-playlists_file = 'playlists.json'
-whisper_model = whisper.load_model("tiny")
 
-def scan_music_library(files, verbose=False):
-    music_data = []
+library = Library(music_library, db_path="virtuosa.db")
+library.scan()
 
-    for f in tqdm.tqdm(files):
-        try:
-            audio = MP3(filepath := Path(f), ID3=EasyID3)
+curator = PlaylistCurator(library, model_name=os.environ.get('VIRTUOSA_MODEL', 'qwen3:8b'))
+threading.Thread(target=curator.warm_up, daemon=True).start()
 
-            track_info = {
-                'filepath': filepath,
-                'title': audio.get('title', [filepath.stem])[0],
-                'artist': audio.get('artist', ['Unknown'])[0],
-                'album': audio.get('album', ['Unknown'])[0],
-                'album_artist': audio.get('albumartist', ['Unknown'])[0],
-                'composer': audio.get('composer', ['Unknown'])[0],
-                'genre': audio.get('genre', ['Unknown'])[0],
-                'year': audio.get('date', ['Unknown'])[0],
-                'track_number': audio.get('tracknumber', ['0'])[0],
-                'disc_number': audio.get('discnumber', ['0'])[0],
-                'bpm': audio.get('bpm', ['Unknown'])[0],
-                'duration': int(audio.info.length),
-                'bitrate': audio.info.bitrate // 1000, # in kbps
-            }
+whisper_model = None
+whisper_lock = threading.Lock()
 
-            if verbose:
-                pprint.pprint(track_info, indent=4)
-            music_data.append(track_info)
-        except Exception as load_audio_file_error:
-            log.error(f"{load_audio_file_error=}")
-
-    return music_data
-
-music_chain = MusicLibraryChain()
-files = list(music_library.rglob("*.mp3"))
-music_chain.initialize_chain(library_data := scan_music_library(files))
+def transcribe(recording, playlist=None):
+    global whisper_model
+    # whisper keeps only the end of a long prompt, so the playlist's artists go last.
+    artists = library.top_artists()
+    if playlist:
+        artists += list(dict.fromkeys(track['artist'] for track in playlist['tracks']))
+    with whisper_lock:
+        if whisper_model is None:
+            whisper_model = whisper.load_model("base.en")
+        result = whisper_model.transcribe(
+            recording,
+            fp16=False,
+            initial_prompt=f"A request for a music playlist. Artists: {', '.join(artists)}.",
+        )
+    return result["text"].strip()
 
 @app.route('/')
 def index():
-    playlists = []
-    if os.path.exists(playlists_file):
-        with open(playlists_file, 'r') as f:
-            playlists = json.load(f)
-
-    music_files = list(music_library.rglob("*.mp3"))
-    return render_template('index.html', playlists=playlists, library=library_data)
-
-@app.route('/api/library')
-def get_library():
-    return jsonify(library_data)
+    return render_template('index.html', track_count=len(library.tracks), artist_count=len(library.artists))
 
 @app.route('/api/playlists')
 def get_playlists():
-    if os.path.exists(playlists_file):
-        with open(playlists_file, 'r') as f:
-            playlists = json.load(f)
-        return jsonify(playlists)
-    return jsonify([])
+    return jsonify(library.playlists())
 
-@app.route('/api/create-playlist/voice', methods=['POST'])
-def create_playlist_from_voice():
-    if 'audio' not in request.files:
-        return jsonify(dict(error='No audio file provided.')), 400
+@app.route('/api/playlists/<int:playlist_id>', methods=['GET', 'DELETE'])
+def playlist(playlist_id):
+    if request.method == 'DELETE':
+        library.delete_playlist(playlist_id)
+        return jsonify(dict(deleted=playlist_id))
+    if (found := library.playlist(playlist_id)) is None:
+        abort(404)
+    return jsonify(found)
 
-    audio_file = request.files['audio']
+@app.route('/api/command', methods=['POST'])
+def command():
+    """Create or edit a playlist from a request, streaming one JSON event per line"""
+    text = request.form.get('text', '').strip()
+    playlist_id = request.form.get('playlist_id', type=int)
 
-    # save the uploaded audio file temporarily.
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
-        audio_file.save(temp_audio.name)
+    recording = None
+    if 'audio' in request.files:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_audio:
+            request.files['audio'].save(temp_audio)
+            recording = temp_audio.name
+    elif not text:
+        return jsonify(dict(error='No audio or text provided.')), 400
 
-        # transcribe audio using Whisper.
-        result = whisper_model.transcribe(temp_audio.name)
-        prompt = result["text"]
-
+    def events():
         try:
-            # create a playlist from the user collection + input prompt.
-            playlist = music_chain.generate_playlist(prompt)
+            existing = library.playlist(playlist_id) if playlist_id else None
 
-            # save playlist metadata.
-            playlists = []
-            if os.path.exists(playlists_file):
-                with open(playlists_file, 'r') as f:
-                    playlists = json.load(f)
+            prompt = transcribe(recording, existing) if recording else text
+            log.info(f'command: {prompt}')
+            if not prompt:
+                raise ValueError("Didn't catch that, try again.")
+            yield dict(event='heard', text=prompt)
 
-            playlists.append(playlist)
-            with open(playlists_file, 'w') as f:
-                json.dump(playlists, f)
+            name = existing['name'] if existing else ''
+            track_ids = [track['id'] for track in existing['tracks']] if existing else []
+            commands = existing['commands'] if existing else []
 
-            return jsonify(playlist)
-        except Exception as create_playlist_error:
-            return jsonify(dict(error=create_playlist_error)), 500
+            for event in curator.edit(prompt, name, track_ids):
+                if event['event'] == 'op':
+                    yield dict(event, tracks=library.public(event['track_ids']))
+                else:
+                    name, track_ids = event['name'], event['track_ids']
 
-@app.route('/stream/<path:filename>')
-def stream_audio(filename):
-    return send_file(os.path.join(music_library, filename))
+            if not existing and not track_ids:
+                raise ValueError("Couldn't find anything in your library for that.")
+
+            saved_id = library.save_playlist(existing and existing['id'], name, track_ids, commands + [prompt])
+            yield dict(event='done', playlist=library.playlist(saved_id))
+        except ValueError as command_error:
+            yield dict(event='error', error=str(command_error))
+        except Exception as command_error:
+            log.exception(f"{command_error=}")
+            yield dict(event='error', error=str(command_error))
+        finally:
+            if recording:
+                os.remove(recording)
+
+    return Response((json.dumps(event) + '\n' for event in events()), mimetype='application/x-ndjson')
+
+@app.route('/api/correct', methods=['POST'])
+def correct():
+    """Redo an operation with the name the user picked, and remember the choice"""
+    data = request.get_json()
+    field, heard, choice = data.get('field'), data.get('heard'), data.get('choice')
+    if field not in ('artists', 'albums', 'titles') or not heard or not choice:
+        return jsonify(dict(error='Nothing to correct.')), 400
+    library.remember(field, heard, choice)
+
+    existing = library.playlist(data['playlist_id']) if data.get('playlist_id') else None
+    track_ids = [track['id'] for track in existing['tracks']] if existing else []
+    operation = data.get('operation', {})
+    result = curator.apply({**operation, 'where': {**operation.get('where', {}), field: [choice]}}, track_ids)
+    if not existing and not result['track_ids']:
+        return jsonify(dict(error="Couldn't find anything in your library for that.")), 404
+
+    saved_id = library.save_playlist(
+        existing and existing['id'],
+        existing['name'] if existing else choice,
+        result['track_ids'],
+        (existing['commands'] if existing else []) + [f"{heard} -> {choice}"],
+    )
+    return jsonify(dict(result, playlist=library.playlist(saved_id)))
+
+@app.route('/stream/<int:track_id>')
+def stream_audio(track_id):
+    if (track := library.tracks.get(track_id)) is None:
+        abort(404)
+    return send_file(track['filepath'], conditional=True)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(port=5889, debug=True)
